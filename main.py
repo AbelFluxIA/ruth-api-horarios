@@ -6,9 +6,9 @@ import httpx
 from datetime import datetime, timedelta
 import json
 
-app = FastAPI(title="Super API Odonto - Match & Schedule")
+app = FastAPI(title="Super API Odonto - Match & Schedule v3.0")
 
-# --- 1. BANCO DE DADOS DOS PROFISSIONAIS (AGORA COM CORES) ---
+# --- 1. BANCO DE DADOS DOS PROFISSIONAIS ---
 PROFESSIONALS = {
     "Dayara": {
         "id": 4773939817545728, 
@@ -60,6 +60,25 @@ PROFESSIONALS = {
     }
 }
 
+# --- 2. MAPA DE REGRAS DE PROCEDIMENTOS (VOCABULÁRIO EXPANDIDO) ---
+# Aqui definimos termos técnicos E coloquiais para cobrir "qualquer situação"
+PROCEDURE_RULES = {
+    "Camylla": ["canal", "endodontia", "nervo", "endo", "matar o nervo"],
+    "Katianne": ["aparelho", "orto", "botox", "harmonizacao", "ferrinho", "manutencao", "invisalign", "preenchimento"],
+    "Vinicius": ["faceta", "lente", "estetica", "sorriso", "laminado"],
+    "Mateus": ["extracao", "siso", "arrancar", "tirar dente", "cirurgia", "exodontia", "molar"],
+    "Ramon": ["protese", "coroa", "gengiva", "implante", "protocolo", "dentadura", "pino", "parafuso", "gengivoplastia"],
+    # Gabriela pega tudo que é geral, infantil ou urgência
+    "Gabriela": [
+        "urgencia", "dor", "infantil", "crianca", "kids", "pediatria", 
+        "limpeza", "restauracao", "obtura", "dentistica", "raspag", 
+        "consulta", "rotina", "avaliacao", "checkup", "olhada", "ver", "orcamento"
+    ]
+}
+
+# Definimos quem é o "Clínico Geral" padrão para casos indefinidos
+DEFAULT_PROFESSIONAL_KEY = "Gabriela"
+
 # --- MODELOS DE DADOS ---
 class ServiceRequest(BaseModel):
     service_text: str
@@ -91,24 +110,32 @@ def find_professional(text: str):
     clean_text = normalize_text(text)
     print(f"LOG: Buscando profissional para o termo: {clean_text}")
     
-    # 1. Busca por nome direto
+    # 1. Busca por NOME do profissional (Prioridade Máxima)
     for key, data in PROFESSIONALS.items():
         for keyword in data["keywords"]:
             if keyword in clean_text:
                 return data
 
-    # 2. Busca por procedimento
-    if "canal" in clean_text or "endodontia" in clean_text: return PROFESSIONALS["Camylla"]
-    if any(word in clean_text for word in ["aparelho", "orto", "botox", "harmonizacao"]): return PROFESSIONALS["Katianne"]
-    if any(word in clean_text for word in ["faceta", "lente", "estetica"]): return PROFESSIONALS["Vinicius"]
-    if any(word in clean_text for word in ["extracao", "siso", "arrancar"]): return PROFESSIONALS["Mateus"]
-    if any(word in clean_text for word in ["protese", "coroa", "gengiva", "implante", "protocolo"]): return PROFESSIONALS["Ramon"]
-    if any(word in clean_text for word in ["urgencia", "dor", "infantil", "crianca", "kids", "pediatria"]): return PROFESSIONALS["Gabriela"]
+    # 2. Busca por ESPECIALIDADE (Vocabulário Expandido)
+    # A ordem importa! Especialidades específicas vêm antes de clínica geral.
     
-    common_procedures = ["clareamento", "limpeza", "profilaxia", "restauracao", "obtura", "dentistica"]
-    if any(word in clean_text for word in common_procedures): return PROFESSIONALS["Gabriela"]
+    # Verifica todos, exceto Gabriela (que é a Geral)
+    for prof_key, keywords in PROCEDURE_RULES.items():
+        if prof_key == "Gabriela": continue 
+        
+        if any(word in clean_text for word in keywords):
+            return PROFESSIONALS[prof_key]
 
-    return None
+    # 3. Verifica termos de CLÍNICA GERAL (Gabriela)
+    # Aqui entram: "rotina", "consulta", "avaliação", "limpeza"
+    if any(word in clean_text for word in PROCEDURE_RULES["Gabriela"]):
+        return PROFESSIONALS["Gabriela"]
+
+    # 4. FALLBACK (Rede de Segurança)
+    # Se o paciente disse algo vago como "preciso marcar", "quero horario", "olá"
+    # ou se o texto não bateu com nada específico, mandamos para Triagem (Gabriela).
+    print("LOG: Nenhum termo específico encontrado. Direcionando para Triagem/Geral.")
+    return PROFESSIONALS[DEFAULT_PROFESSIONAL_KEY]
 
 # --- ROTA PRINCIPAL ---
 @app.post("/match-and-schedule")
@@ -119,18 +146,17 @@ async def match_and_schedule(request: ServiceRequest):
     # --- PASSO 1 & 2: IDENTIFICAR O PROFISSIONAL ---
     professional = find_professional(request.service_text)
     
+    # Nota: Com o Fallback no passo 4, raramente entraremos aqui, mas mantemos por segurança
     if not professional:
-        print("LOG: Erro - Profissional não identificado.")
         return {
             "success": False,
-            "message": "Não conseguimos identificar o serviço ou profissional desejado.",
-            "cor": None # Retorna nulo para segurança do frontend
+            "message": "Não conseguimos identificar o serviço.",
+            "cor": None
         }
     
-    # Extração de dados (Incluindo a COR)
     target_id = professional["id"]
     target_name = professional["name"]
-    target_color = professional.get("color", "#CCCCCC") # Fallback cor cinza se falhar
+    target_color = professional.get("color", "#CCCCCC")
     
     print(f"LOG: Profissional identificado: {target_name} (Color: {target_color})")
 
@@ -141,7 +167,6 @@ async def match_and_schedule(request: ServiceRequest):
     date_from = today.strftime("%Y-%m-%d")
     date_to = end_date.strftime("%Y-%m-%d")
     
-    # ! IMPORTANTE: Em produção, mova credentials para variáveis de ambiente (.env)
     url_clinicorp = (
         f"https://api.clinicorp.com/rest/v1/appointment/get_avaliable_days"
         f"?subscriber_id=odontomaria&code_link=57762"
@@ -164,7 +189,7 @@ async def match_and_schedule(request: ServiceRequest):
                 print(f"LOG: Erro na Clinicorp. Status: {response.status_code}")
                 return {
                     "success": False,
-                    "message": f"Erro ao conectar com a agenda. Código: {response.status_code}",
+                    "message": f"Erro na agenda externa. Código: {response.status_code}",
                     "cor": target_color
                 }
             
@@ -172,7 +197,7 @@ async def match_and_schedule(request: ServiceRequest):
             if not isinstance(schedules_raw, list):
                  return {
                      "success": False, 
-                     "message": "Formato de agenda inválido do sistema externo.",
+                     "message": "Erro de formato na resposta da agenda.",
                      "cor": target_color
                  }
 
@@ -206,29 +231,29 @@ async def match_and_schedule(request: ServiceRequest):
         print(f"LOG: Erro ao filtrar dados: {str(e)}")
         return {
             "success": False,
-            "message": "Erro ao processar os horários disponíveis.",
+            "message": "Erro ao processar horários.",
             "cor": target_color
         }
 
-    # --- PASSO 5: RESPOSTA FINAL (COM COR) ---
+    # --- PASSO 5: RESPOSTA FINAL ---
     count_days = len(filtered_days)
     print(f"LOG: Sucesso. Encontrados {count_days} dias.")
 
     if count_days == 0:
         return {
             "success": True,
-            "message": f"Identificamos {target_name}, mas não há horários livres (15 dias).",
+            "message": f"Agendamento com {target_name}. Sem horários livres nos próximos 15 dias.",
             "professional_id": target_id,
             "professional_name": target_name,
-            "cor": target_color, # <--- AQUI
+            "cor": target_color,
             "schedules": []
         }
 
     return {
         "success": True,
-        "message": "Horários encontrados com sucesso.",
+        "message": f"Horários encontrados para {target_name}.",
         "professional_id": target_id,
         "professional_name": target_name,
-        "cor": target_color, # <--- E AQUI
+        "cor": target_color,
         "schedules": filtered_days
-                }
+    }
